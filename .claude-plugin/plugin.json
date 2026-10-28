@@ -1,0 +1,10 @@
+{
+  "name": "dokimasia",
+  "version": "0.1.0",
+  "description": "Run untrusted repos in a disposable QEMU VM that you or your agent drive from the host.",
+  "author": { "name": "DevoRia" },
+  "homepage": "https://github.com/DevoRia/dokimasia",
+  "repository": "https://github.com/DevoRia/dokimasia",
+  "license": "MIT",
+  "keywords": ["sandbox", "qemu", "supply-chain", "vm"]
+}

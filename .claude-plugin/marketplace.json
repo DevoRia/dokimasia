@@ -1,0 +1,11 @@
+{
+  "name": "dokimasia",
+  "owner": { "name": "DevoRia" },
+  "plugins": [
+    {
+      "name": "dokimasia",
+      "source": "./",
+      "description": "Run untrusted repos in a disposable QEMU VM that you or your agent drive from the host."
+    }
+  ]
+}

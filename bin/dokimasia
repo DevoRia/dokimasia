@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""dokimasia — run untrusted code in a disposable QEMU VM that you (or an agent) drive from the host.
+
+The host never executes anything from the repo. The repo is copied into the VM on a
+read-only ISO, commands go in over a private virtio-serial socket, and everything that
+comes back is treated as plain text.
+"""
+import argparse
+import base64
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import textwrap
+import time
+import uuid
+from pathlib import Path
+
+VERSION = "0.3.0"
+HOME = Path(os.environ.get("DOKIMASIA_HOME", Path.home() / ".dokimasia"))
+BASE = HOME / "base.qcow2"
+SESSIONS = HOME / "sessions"
+MARKER = re.compile(rb"\n?DKM[0-9a-f]{32}(:\d+|-S)\n")
+
+
+def die(msg):
+    sys.exit(f"dokimasia: {msg}")
+
+
+def say(msg):
+    print(f"▸ {msg}", file=sys.stderr, flush=True)
+
+
+def safe(data):
+    """Guest output is untrusted: drop terminal escape sequences and control chars."""
+    text = data.decode("utf-8", "replace")
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07?", "", text)
+    return "".join(c if c in "\n\t" or ord(c) >= 32 else "" for c in text)
+
+
+# --- platform -----------------------------------------------------------------
+ARCH = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "amd64", "amd64": "amd64"}.get(platform.machine().lower())
+IMAGE_URL = f"https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-{ARCH}.qcow2"
+
+
+def qemu(cpus=2, memory="2G"):
+    if not ARCH:
+        die(f"unsupported CPU: {platform.machine()}")
+    exe = "qemu-system-aarch64" if ARCH == "arm64" else "qemu-system-x86_64"
+    path = shutil.which(exe) or die(f"{exe} not found (brew install qemu / apt install qemu-system)")
+    system = platform.system()
+    if system == "Darwin":
+        accel, cpu = "hvf", "host"
+    elif system == "Linux" and os.access("/dev/kvm", os.W_OK):
+        accel, cpu = "kvm", "host"
+    elif system == "Linux":
+        say("no /dev/kvm access — falling back to slow emulation")
+        accel, cpu = "tcg", "max"
+    else:
+        die(f"unsupported OS: {system} (on Windows use WSL2)")
+    cmd = [path, "-M", "virt" if ARCH == "arm64" else "q35", "-accel", accel, "-cpu", cpu,
+           "-smp", str(cpus), "-m", memory, "-display", "none", "-monitor", "none", "-no-reboot"]
+    if ARCH == "arm64":
+        share = Path(path).resolve().parent.parent / "share/qemu"
+        for fw in [share / "edk2-aarch64-code.fd", Path("/usr/share/qemu/edk2-aarch64-code.fd"),
+                   Path("/usr/share/AAVMF/AAVMF_CODE.fd"), Path("/usr/share/qemu-efi-aarch64/QEMU_EFI.fd")]:
+            if fw.exists():
+                cmd += ["-drive", f"if=pflash,format=raw,readonly=on,file={fw}"]
+                break
+        else:
+            die("UEFI firmware for aarch64 not found (install qemu-efi-aarch64)")
+    return cmd
+
+
+def seed_iso(dirpath, iso, instance_id, user_data):
+    """cloud-init NoCloud seed: a read-only ISO labelled "cidata"."""
+    (dirpath / "meta-data").write_text(f"instance-id: {instance_id}\n")
+    (dirpath / "user-data").write_text(user_data)
+    for tool in (["hdiutil", "makehybrid", "-quiet", "-iso", "-joliet", "-default-volume-name", "cidata", "-o"],
+                 ["xorriso", "-as", "mkisofs", "-quiet", "-V", "cidata", "-J", "-r", "-o"],
+                 ["genisoimage", "-quiet", "-V", "cidata", "-J", "-r", "-o"]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool + [str(iso), str(dirpath)], check=True)
+            return
+    die("need hdiutil, xorriso or genisoimage to build the seed ISO")
+
+
+def drives(disk, iso):
+    return ["-drive", f"if=virtio,format=qcow2,file={disk}",
+            "-drive", f"if=virtio,format=raw,readonly=on,file={iso}"]
+
+
+# --- init ---------------------------------------------------------------------
+INIT_USER_DATA = """#cloud-config
+package_update: true
+packages: [nodejs, npm, python3-pip, python3-venv, git, make, build-essential, curl, strace]
+runcmd:
+  - [sh, -c, "command -v node && for t in /dev/ttyAMA0 /dev/ttyS0; do [ -c $t ] && timeout 5 sh -c \\"echo DOKIMASIA-READY > $t\\"; done"]
+power_state: {mode: poweroff, condition: true}
+"""
+
+
+def cmd_init(a=None):
+    if BASE.exists() and not getattr(a, "force", False):
+        return say(f"already initialized: {BASE} (dokimasia init --force rebuilds it)")
+    HOME.mkdir(parents=True, exist_ok=True)
+    base_cmd = qemu()
+    with tempfile.TemporaryDirectory(dir=HOME) as tmp:
+        tmp = Path(tmp)
+        disk, seed, log = tmp / "disk.qcow2", tmp / "seed", tmp / "serial.log"
+        say(f"downloading Debian 13 cloud image ({ARCH}, ~350 MB)…")
+        subprocess.run(["curl", "-fL", "--progress-bar", "-o", str(disk), IMAGE_URL], check=True)
+        subprocess.run(["qemu-img", "resize", "-q", str(disk), "8G"], check=True)
+        seed.mkdir()
+        seed_iso(seed, tmp / "seed.iso", "dokimasia-base", INIT_USER_DATA)
+        say("installing toolchain inside the base VM (a few minutes)…")
+        subprocess.run(base_cmd + drives(disk, tmp / "seed.iso") +
+                       ["-nic", "user,model=virtio-net-pci", "-serial", f"file:{log}"], timeout=1200)
+        if "DOKIMASIA-READY" not in log.read_text(errors="replace"):
+            shutil.copy(log, HOME / "init-serial.log")
+            die(f"base image setup failed, see {HOME / 'init-serial.log'}")
+        disk.rename(BASE)
+    say(f"ready: {BASE}")
+
+
+ADD_USER_DATA = """#cloud-config
+package_update: true
+packages: [{packages}]
+runcmd:
+  - [sh, -c, "dpkg -s {names} >/dev/null && for t in /dev/ttyAMA0 /dev/ttyS0; do [ -c $t ] && timeout 5 sh -c \\"echo DOKIMASIA-READY > $t\\"; done"]
+power_state: {{mode: poweroff, condition: true}}
+"""
+
+
+def cmd_add(a):
+    """Install extra tools into the clean base image — online, before any untrusted code is loaded."""
+    bad = [p for p in a.packages if not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", p)]
+    if bad:
+        die(f"not a Debian package name: {' '.join(bad)}")
+    running = [s.name for s in SESSIONS.glob("*") if alive(s)] if SESSIONS.exists() else []
+    if running:
+        die(f"stop running sessions first: {' '.join(running)}")
+    if not BASE.exists():
+        cmd_init()
+    base_cmd = qemu()
+    with tempfile.TemporaryDirectory(dir=HOME) as tmp:
+        tmp = Path(tmp)
+        overlay, seed, log = tmp / "overlay.qcow2", tmp / "seed", tmp / "serial.log"
+        subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(BASE), str(overlay)],
+                       check=True)
+        seed.mkdir()
+        seed_iso(seed, tmp / "seed.iso", f"add-{uuid.uuid4().hex}",
+                 ADD_USER_DATA.format(packages=", ".join(a.packages), names=" ".join(a.packages)))
+        say(f"installing {' '.join(a.packages)} into the base image…")
+        subprocess.run(base_cmd + drives(overlay, tmp / "seed.iso") +
+                       ["-nic", "user,model=virtio-net-pci", "-serial", f"file:{log}"], timeout=1800)
+        if "DOKIMASIA-READY" not in log.read_text(errors="replace"):
+            shutil.copy(log, HOME / "add-serial.log")
+            die(f"install failed, base image unchanged — see {HOME / 'add-serial.log'}")
+        subprocess.run(["qemu-img", "commit", "-q", str(overlay)], check=True)
+    say(f"added to base image: {' '.join(a.packages)}")
+
+
+# --- sessions -----------------------------------------------------------------
+# The guest runs a root shell on a virtio-serial port. Nothing listens on the network.
+SESSION_USER_DATA = """#cloud-config
+runcmd:
+  - [sh, -c, "mkdir -p /mnt/seed /work && mount -o ro -L cidata /mnt/seed && tar -xzf /mnt/seed/repo.tgz -C /work && umount /mnt/seed"]
+  - [systemd-run, --unit=dokimasia-agent, sh, -c, "while :; do bash --noprofile --norc <> /dev/virtio-ports/dokimasia >&0 2>&0; sleep 0.2; done"]
+"""
+
+
+def session(name):
+    return SESSIONS / name
+
+
+def alive(s):
+    try:
+        os.kill(int((s / "qemu.pid").read_text()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def fetch(target, dest):
+    if "://" in target or target.startswith("git@"):
+        say(f"cloning {target} (no hooks, no submodules)…")
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_TERMINAL_PROMPT="0")
+        subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                        "-c", "protocol.file.allow=never", "clone", "-q", "--depth=1",
+                        "--no-recurse-submodules", "--", target, str(dest)], env=env, check=True)
+        return dest
+    src = Path(target).expanduser()
+    if not src.is_dir():
+        die(f"not a directory: {src}")
+    return src
+
+
+def cmd_up(a):
+    s = session(a.name)
+    if alive(s):
+        die(f"session '{a.name}' is already running (dokimasia down --name {a.name})")
+    if not BASE.exists():
+        cmd_init()
+    base_cmd = qemu(a.cpus, a.memory)
+    shutil.rmtree(s, ignore_errors=True)
+    (s / "seed").mkdir(parents=True)
+    os.chmod(s, 0o700)
+
+    src = fetch(a.target, s / "src")
+    # Symlinks are archived as links, never followed, so a link to ~/.ssh stays a dangling link.
+    with tarfile.open(s / "seed/repo.tgz", "w:gz") as tar:
+        tar.add(src, arcname=".")
+    shutil.rmtree(s / "src", ignore_errors=True)
+    seed_iso(s / "seed", s / "seed.iso", f"session-{uuid.uuid4().hex}", SESSION_USER_DATA)
+    subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(BASE), str(s / "disk.qcow2"),
+                    a.disk], check=True)  # the guest grows its root partition to fit on boot
+
+    nic = ["-nic", "user,model=virtio-net-pci"] if a.net else ["-nic", "none"]
+    subprocess.run(base_cmd + drives(s / "disk.qcow2", s / "seed.iso") + nic + [
+        "-device", "virtio-serial-pci",
+        "-chardev", f"socket,id=ctl,path={s / 'ctl.sock'},server=on,wait=off",
+        "-device", "virtserialport,chardev=ctl,name=dokimasia",
+        "-serial", f"file:{s / 'console.log'}",
+        "-daemonize", "-pidfile", str(s / "qemu.pid")], check=True)
+    (s / "network").write_text("on" if a.net else "off")
+
+    say(f"booting '{a.name}' ({a.cpus} CPU, {a.memory} RAM, {a.disk} disk, network: {'ON' if a.net else 'off'})…")
+    deadline = time.time() + 240
+    while time.time() < deadline:
+        try:
+            if guest_exec(s, "true", timeout=3, echo=False) == 0:
+                return say(f"ready — dokimasia exec{name_flag(a.name)} -- <cmd>")
+        except OSError:
+            pass
+        time.sleep(1)
+    die(f"VM did not become ready, see {s / 'console.log'}")
+
+
+def name_flag(name):
+    return "" if name == "default" else f" --name {name}"
+
+
+def guest_exec(s, script, timeout, echo=True):
+    """Send a script to the guest shell, stream its output, return its exit code (124 on timeout)."""
+    m = "DKM" + uuid.uuid4().hex
+    payload = "\n".join(textwrap.wrap(base64.b64encode(f"cd /work\n{script}\n".encode()).decode(), 76))
+    request = (f"base64 -d > /tmp/{m} <<'{m}'\n{payload}\n{m}\n"
+               f"printf '\\n{m}-S\\n'; bash --noprofile --norc /tmp/{m} </dev/null 2>&1; r=$?; rm -f /tmp/{m}; printf '\\n{m}:%s\\n' $r\n")
+    start = f"\n{m}-S\n".encode()  # anything before it is leftover output of an earlier command
+    done = re.compile(rb"\n" + m.encode() + rb":(\d+)\n")
+
+    def emit(chunk):
+        if echo and chunk:
+            sys.stdout.write(safe(MARKER.sub(b"", chunk)))
+            sys.stdout.flush()
+
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(5)
+        sock.connect(str(s / "ctl.sock"))
+        sock.sendall(request.encode())
+        buf, shown, started, deadline = b"", 0, False, time.time() + timeout
+        while time.time() < deadline:
+            sock.settimeout(max(0.1, min(1.0, deadline - time.time())))
+            try:
+                data = sock.recv(65536)
+            except socket.timeout:
+                continue
+            if not data:
+                break
+            buf += data
+            if not started:
+                if start not in buf:
+                    continue
+                buf, started = buf.split(start, 1)[1], True
+            hit = done.search(buf)
+            if hit:
+                emit(buf[shown:hit.start()])
+                return int(hit[1])
+            keep = max(shown, len(buf) - len(m) - 16)  # hold back a possibly split marker
+            emit(buf[shown:keep])
+            shown = keep
+    if started:
+        emit(buf[shown:])
+    return 124
+
+
+def running(name):
+    s = session(name)
+    if not alive(s):
+        die(f"no running session '{name}' (dokimasia up <repo>{name_flag(name)})")
+    return s
+
+
+def cmd_exec(a):
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        die("usage: dokimasia exec -- <cmd...>")
+    script = cmd[0] if len(cmd) == 1 else " ".join(_quote(c) for c in cmd)
+    code = guest_exec(running(a.name), script, a.timeout)
+    if code == 124:
+        say(f"timed out after {a.timeout}s — the command may still be running in the VM")
+    sys.exit(code)
+
+
+def _quote(arg):
+    return arg if re.fullmatch(r"[\w@%+=:,./-]+", arg) else "'" + arg.replace("'", "'\\''") + "'"
+
+
+def cmd_logs(a):
+    log = running(a.name) / "console.log"
+    lines = safe(log.read_bytes()).splitlines()
+    print("\n".join(lines[-a.lines:]))
+
+
+def cmd_down(a):
+    s = session(a.name)
+    if alive(s):
+        pid = int((s / "qemu.pid").read_text())
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            if not alive(s):
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    shutil.rmtree(s, ignore_errors=True)
+    say(f"'{a.name}' destroyed")
+
+
+def cmd_ls(_):
+    for s in sorted(SESSIONS.glob("*")) if SESSIONS.exists() else []:
+        net = (s / "network").read_text() if (s / "network").exists() else "?"
+        print(f"{s.name}\t{'running' if alive(s) else 'stopped'}\tnetwork:{net}")
+
+
+def cmd_run(a):
+    a.name = f"run-{uuid.uuid4().hex[:6]}"
+    try:
+        cmd_up(a)
+        cmd_exec(a)
+    finally:
+        cmd_down(a)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="dokimasia", description="Run untrusted code in a disposable QEMU VM.")
+    p.add_argument("-v", "--version", action="version", version=f"dokimasia {VERSION}")
+    sub = p.add_subparsers(dest="action", required=True)
+
+    init = sub.add_parser("init", help="download + prepare the base VM image (once)")
+    init.add_argument("--force", action="store_true", help="rebuild the base image")
+    init.set_defaults(fn=cmd_init)
+
+    add = sub.add_parser("add", help="install apt packages into the base image (online, before any repo is loaded)")
+    add.add_argument("packages", nargs="+", metavar="package")
+    add.set_defaults(fn=cmd_add)
+
+    def with_vm(sp):
+        sp.add_argument("target")
+        sp.add_argument("--net", action="store_true", help="give the VM outbound network (default: no network device)")
+        sp.add_argument("--cpus", type=int, default=2)
+        sp.add_argument("--memory", default="2G", help="RAM, e.g. 8G (default: 2G)")
+        sp.add_argument("--disk", default="16G", help="disk size, e.g. 40G (default: 16G)")
+        return sp
+
+    def with_name(sp):
+        sp.add_argument("--name", default="default", help="session name (default: default)")
+        return sp
+
+    with_vm(with_name(sub.add_parser("up", help="boot a VM with a copy of <dir|git-url> in /work"))).set_defaults(fn=cmd_up)
+
+    ex = with_name(sub.add_parser("exec", help="run a command inside the VM (cwd /work)"))
+    ex.add_argument("--timeout", type=int, default=600)
+    ex.add_argument("cmd", nargs=argparse.REMAINDER)
+    ex.set_defaults(fn=cmd_exec)
+
+    run = with_vm(sub.add_parser("run", help="up + exec + down in one go"))
+    run.add_argument("--timeout", type=int, default=600)
+    run.add_argument("cmd", nargs=argparse.REMAINDER)
+    run.set_defaults(fn=cmd_run)
+
+    lg = with_name(sub.add_parser("logs", help="show the VM serial console"))
+    lg.add_argument("-n", "--lines", type=int, default=50)
+    lg.set_defaults(fn=cmd_logs)
+
+    with_name(sub.add_parser("down", help="kill the VM and delete its disk")).set_defaults(fn=cmd_down)
+    sub.add_parser("ls", help="list sessions").set_defaults(fn=cmd_ls)
+
+    a = p.parse_args()
+    try:
+        a.fn(a)
+    except subprocess.CalledProcessError as e:
+        die(f"{Path(e.cmd[0]).name} failed (exit {e.returncode})")
+
+
+if __name__ == "__main__":
+    main()
