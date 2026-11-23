@@ -9,7 +9,10 @@ Untrusted code never runs on the host. You drive a throwaway VM from the host wi
 
 ## Find the CLI
 
-Use `dokimasia` if it is on PATH, otherwise `<this skill's base directory>/../../bin/dokimasia`. Needs `qemu` and Python 3. The first `up` downloads and prepares a ~350 MB Debian image (a few minutes) — tell the user and use a long Bash timeout (600000 ms).
+Use `dokimasia` if it is on PATH, otherwise the copy bundled with this skill: `<this skill's base directory>/dokimasia` (run it as `python3 <that path> …`). Check first with `command -v dokimasia qemu-img`.
+
+- **Needs QEMU.** If `qemu-img` / `qemu-system-*` are missing, tell the user the install command (`brew install qemu`, or `sudo apt install qemu-system qemu-utils xorriso`) and let them run it. Don't install system packages yourself.
+- **First run** (`dokimasia init`, also triggered by the first `up`) downloads and prepares a ~350 MB Debian image over the network and takes a few minutes. Tell the user before starting it and use a long Bash timeout (600000 ms).
 
 ## Workflow
 
@@ -25,6 +28,14 @@ dokimasia down                               # kill VM, delete its disk
 - `dokimasia run <dir|git-url> -- <cmd>` is up + exec + down for a one-shot check.
 - Each `exec` is a fresh root shell in `/work`; files persist between calls, environment variables do not.
 - Long jobs: `exec -- 'nohup make > build.log 2>&1 &'`, then poll with `exec -- tail build.log`. A timed-out `exec` keeps running in the VM.
+
+## Audit first
+
+`dokimasia audit <dir|git-url>` is a read-only scan for things that run on open/install (`.vscode/tasks.json` folder-open tasks, devcontainer commands, npm lifecycle scripts, agent hooks, MCP servers). Run it before `up` when the source is unknown and show the user any HIGH findings. Exit code 2 means high-risk. Never open a flagged folder in an editor on the host.
+
+## When to use it
+
+Use this skill whenever the user wants to run, install, build, test or open something they didn't write and haven't vetted: "clone this repo and run it", a recruiter's take-home, a PoC from an issue, a random package, a sample to reverse-engineer. Skip it for the user's own trusted projects.
 
 ## Rules
 

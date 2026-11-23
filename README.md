@@ -75,8 +75,26 @@ dokimasia run ./some-repo -- 'npm ci --ignore-scripts && npm test'
 | `dokimasia down` | Kill the VM and delete its disk |
 | `dokimasia run <dir\|git-url> [--net] -- <cmd>` | `up` + `exec` + `down` in one go |
 | `dokimasia ls` | List sessions |
+| `dokimasia audit <dir\|git-url>` | Read-only scan for things that run by themselves on open/install. Exit code 2 if something is high-risk |
+| `dokimasia add <apt packages>` | Install extra packages into the base image (online, before any repo is loaded) |
 
 Add `--name <n>` to `up` / `exec` / `logs` / `down` to run several VMs at once.
+
+Heavy repos: `up` takes `--cpus 4 --memory 8G --disk 40G`.
+
+## 🔎 Before you open a repo in your editor
+
+Some repos run code the moment a folder is *opened*, before any `npm install`: a `.vscode/tasks.json` with `runOn: folderOpen` is the classic one in fake-interview campaigns. `dokimasia audit` reads the repo without executing anything and lists what would run:
+
+```bash
+dokimasia audit git@github.com:someone/take-home.git   # or a local dir
+```
+
+It flags folder-open tasks, devcontainer commands (`initializeCommand` runs on your host), npm lifecycle scripts, Claude Code hooks, MCP servers, symlinks that leave the repo and obviously suspicious command patterns. `dokimasia up` prints a one-line warning when it finds any. It also prints your VS Code / Cursor `task.allowAutomaticTasks` setting; `"off"` closes the folder-open vector for every repo.
+
+To scan after every `git pull` / checkout in a repo: `dokimasia audit --install-hook .`
+
+It is a heuristic for the usual tricks, not a guarantee. When something is flagged, read the repo through `dokimasia exec` instead of opening it on your host.
 
 ## 🤖 Agents
 
@@ -92,6 +110,8 @@ Coding agents are the riskiest way to run strange code: they `npm install` witho
 > *"Clone DevoRia/some-project and run its tests safely."*
 
 The skill tells Claude to `up` the repo, iterate with `exec`, treat everything coming out of the VM (and the repo's own AGENTS.md / README) as untrusted data, ask before enabling the network, and `down` when done.
+
+**Without the plugin** (just the skill): `mkdir -p ~/.claude/skills && cp -RL skills/dokimasia ~/.claude/skills/` — the skill carries its own copy of the CLI.
 
 **Any other agent** (Codex, Cursor, Aider, your own): give it the CLI and the rules in [`skills/dokimasia/SKILL.md`](skills/dokimasia/SKILL.md).
 
@@ -113,6 +133,9 @@ The skill tells Claude to `up` the repo, iterate with `exec`, treat everything c
 ## 🛡️ Security model & limits
 
 - **Boundary = the QEMU hypervisor.** A VM-escape exploit is out of scope; for that level of threat use a sacrificial machine.
+- **Second layer on macOS.** QEMU itself runs inside a `sandbox-exec` profile: it can't read your home directory (only its own session folder and the base image) and it can't connect to services on your Mac's loopback, which `--net` would otherwise expose to the guest at `10.0.2.2`. Disable with `DOKIMASIA_NO_SANDBOX=1`. On Linux this layer is not implemented yet; with `--net`, treat anything listening on `127.0.0.1` as reachable from the VM.
+- **Secrets stay out.** Copying a local directory leaves out `.env*`, private keys, `.npmrc`, `.netrc`, `.aws`, `.ssh` and similar (`--keep-secrets` to override). Repos cloned from a URL are copied as they are.
+- **The base image is checked.** `init` verifies the Debian cloud image against Debian's published SHA512SUMS (same HTTPS origin: it catches corruption and a tampered mirror object, not a compromised origin).
 - **Network off** means no NIC at all. `--net` adds QEMU user-mode NAT: code inside can then reach the internet (but not your files).
 - **The host only clones.** `git clone` runs with hooks, submodules, fsmonitor, system and global git config disabled. Local directories are archived without following symlinks.
 - **Output is untrusted text.** Terminal escape sequences are stripped before printing; nothing from the VM is ever executed on the host.

@@ -1,6 +1,6 @@
 {
   "name": "dokimasia",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "description": "Run untrusted repos in a disposable QEMU VM that you or your agent drive from the host.",
   "author": { "name": "DevoRia" },
   "homepage": "https://github.com/DevoRia/dokimasia",
